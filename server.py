@@ -1,75 +1,168 @@
 #!/usr/bin/env python3
 """vision-mcp - 给纯文本主模型补齐视觉能力的轻量 MCP server。
 
-原理：主模型（Claude/Codex 等）看到图片但无法理解时，通过 MCP 工具把图片交给
+原理：主模型（Claude Code / Codex 等）看到图片但无法理解时，通过 MCP 工具把图片交给
 一个 OpenAI 兼容的多模态模型（如 Qwen-VL、GPT-4o、Gemini、本地 vLLM 等）分析，
 再把返回的文本结果交还给主模型。
 
+特性：
 - 仅本地 stdio 运行，无硬编码绝对路径；
-- 配置优先读取 config.json，其次环境变量，最后默认值（见 README）；
-- 图片支持本地路径 / http(s) URL / base64 data URL 三种输入方式。
+- 配置优先级：config.json > 进程环境变量 > .env 文件 > 默认值（见 README）；
+- 图片支持本地路径 / http(s) URL / base64 data URL 三种输入方式；
+- 对 429 / 5xx / 网络抖动自动重试（次数与退避可配置）；
+- `vision_instructions` MCP prompt 自动教会主模型何时调用视觉工具；
+- `vision_analyze_batch` 支持并发批量分析多张图片；
+- `python server.py --check` 可打印生效配置，便于排查接入问题。
 """
+
 import base64
+import http.client
+import importlib.metadata
 import io
 import json
 import mimetypes
 import os
-import urllib.request
+import sys
+import time
 import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+__version__ = "1.1.0"
 
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError:  # pragma: no cover
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        raise SystemExit("缺少依赖 mcp，请先执行: pip install -r requirements.txt") from None
+    try:
+        installed = importlib.metadata.version("mcp")
+    except Exception:
+        installed = "未知"
     raise SystemExit(
-        "缺少依赖 mcp，请先执行: pip install -r requirements.txt"
-    )
+        "vision-mcp 依赖 mcp SDK 1.x 的 FastMCP 接口，但当前环境不兼容。\n"
+        f"检测到已安装 mcp {installed}，请执行: pip install 'mcp>=1.0,<2'"
+    ) from None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:  # pragma: no cover
-    Image = None  # 未安装 Pillow 时禁用自动缩放，但基础功能仍可用
+    Image = None
+    ImageOps = None
 
 
 # --------------------------------------------------------------------------- #
-# 配置（优先读取 config.json，其次环境变量，最后默认值）
+# 配置：优先级 config.json > 进程环境变量 > .env 文件 > 默认值
 # --------------------------------------------------------------------------- #
+CONFIG_PATH = Path(__file__).parent / "config.json"
+DOTENV_PATH = Path(
+    os.environ.get("VISION_DOTENV_PATH") or (Path(__file__).parent / ".env")
+).expanduser()
+
+
+def _log_warning(message: str) -> None:
+    """警告统一输出到 stderr：stdio 模式下 stdout 是 MCP 协议通道。"""
+    print(f"警告：{message}", file=sys.stderr)
+
+
 def _load_config() -> dict:
-    """从 config.json 加载配置"""
-    config_path = Path(__file__).parent / "config.json"
-    if config_path.exists():
+    """从 config.json 加载配置。"""
+    if CONFIG_PATH.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"警告：读取 config.json 失败: {e}，将使用环境变量")
+            _log_warning(f"读取 config.json 失败: {e}，将使用环境变量")
     return {}
 
 
+def _load_dotenv() -> dict:
+    """极简 .env 解析器（避免引入额外依赖），支持注释与引号包裹的值。"""
+    values: dict[str, str] = {}
+    if not DOTENV_PATH.exists():
+        return values
+    try:
+        for raw_line in DOTENV_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key:
+                values[key] = value
+    except Exception as e:
+        _log_warning(f"读取 .env 失败: {e}")
+    return values
+
+
 _config = _load_config()
+_dotenv = _load_dotenv()
 
 
 def _get_config(key: str, env_key: str, default: str = "") -> str:
-    """优先从 config.json 获取，其次环境变量"""
-    # 先尝试配置文件
-    if key in _config:
+    """按 config.json > 进程环境变量 > .env > 默认值的优先级取配置。"""
+    if key in _config and _config[key] not in (None, ""):
         return str(_config[key]).strip()
-    # 再尝试环境变量
-    return os.environ.get(env_key, default).strip()
+    if env_key in os.environ:
+        return os.environ[env_key].strip()
+    if env_key in _dotenv:
+        return _dotenv[env_key].strip()
+    return default.strip()
 
 
-BASE_URL = _get_config("base_url", "VISION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
+def _as_int(key: str, env_key: str, default: int) -> int:
+    raw = _get_config(key, env_key, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        _log_warning(f"配置 {env_key} 不是合法整数（{raw!r}），使用默认值 {default}")
+        return default
+
+
+def _as_float(key: str, env_key: str, default: float) -> float:
+    raw = _get_config(key, env_key, str(default))
+    try:
+        return float(raw)
+    except ValueError:
+        _log_warning(f"配置 {env_key} 不是合法数字（{raw!r}），使用默认值 {default}")
+        return default
+
+
+def _as_bool(key: str, env_key: str, default: bool) -> bool:
+    raw = _get_config(key, env_key, str(default)).lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    _log_warning(f"配置 {env_key} 不是合法布尔值（{raw!r}），使用默认值 {default}")
+    return default
+
+
+BASE_URL = _get_config(
+    "base_url", "VISION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+).rstrip("/")
 API_KEY = _get_config("api_key", "VISION_API_KEY")
 MODEL = _get_config("model", "VISION_MODEL", "qwen-vl-plus")
-MAX_TOKENS = int(_get_config("max_tokens", "VISION_MAX_TOKENS", "4096") or 4096)
-TIMEOUT = float(_get_config("timeout", "VISION_TIMEOUT", "120") or 120)
-MAX_IMAGE_BYTES = int(_get_config("max_image_bytes", "VISION_MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
-MAX_IMAGE_DIMENSION = int(_get_config("max_image_dimension", "VISION_MAX_IMAGE_DIMENSION", "4000"))
+MAX_TOKENS = _as_int("max_tokens", "VISION_MAX_TOKENS", 4096)
+TIMEOUT = _as_float("timeout", "VISION_TIMEOUT", 120.0)
+MAX_RETRIES = _as_int("max_retries", "VISION_MAX_RETRIES", 2)
+RETRY_BACKOFF = _as_float("retry_backoff", "VISION_RETRY_BACKOFF", 2.0)
+MAX_IMAGE_BYTES = _as_int(
+    "max_image_bytes", "VISION_MAX_IMAGE_BYTES", 20 * 1024 * 1024
+)
+MAX_IMAGE_DIMENSION = _as_int(
+    "max_image_dimension", "VISION_MAX_IMAGE_DIMENSION", 4000
+)
 SERVER_NAME = _get_config("server_name", "MCP_SERVER_NAME", "vision-mcp")
 
 # 图片自动缩放开关：未安装 Pillow 时强制关闭
-AUTO_RESIZE = bool(_get_config("auto_resize", "VISION_AUTO_RESIZE", "true").lower() in {"1", "true", "yes", "on"})
+AUTO_RESIZE = _as_bool("auto_resize", "VISION_AUTO_RESIZE", True)
 if AUTO_RESIZE and Image is None:
+    _log_warning("未安装 Pillow，图片自动缩放已禁用；建议执行 pip install -r requirements.txt")
     AUTO_RESIZE = False
 
 _ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -81,6 +174,13 @@ _MIME_BY_EXT = {
     ".gif": "image/gif",
     ".bmp": "image/bmp",
 }
+_FORMAT_TO_MIME = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+    "GIF": "image/gif",
+    "BMP": "image/bmp",
+}
 
 mcp = FastMCP(SERVER_NAME)
 
@@ -89,10 +189,7 @@ mcp = FastMCP(SERVER_NAME)
 # 图片解析
 # --------------------------------------------------------------------------- #
 def _resolve_image(image: str) -> str:
-    """把三种输入方式统一解析为 data: URL（. 本地路径 / http(s) / data:）。
-
-    返回可直接塞进 OpenAI image_url 的字符串。
-    """
+    """把本地路径 / http(s) URL / data URL 统一解析为可放入 OpenAI image_url 的字符串。"""
     image = image.strip()
     if not image:
         raise ValueError("image 不能为空")
@@ -101,15 +198,9 @@ def _resolve_image(image: str) -> str:
     if image.startswith("data:"):
         return image
 
-    # http(s) URL -> 原样透传（交给服务端拉取）
+    # http(s) URL -> 原样透传（交给视觉后端拉取）
     if image.startswith(("http://", "https://")):
         return image
-
-    # base64 裸串（无 data: 前缀）-> 尝试按 png 包装
-    if "," in image and image.split(",")[0].isascii():
-        prefix, payload = image.split(",", 1)
-        if prefix.startswith("data:") and prefix.endswith(";base64"):
-            return image
 
     # 其余按本地文件路径处理
     p = Path(image).expanduser()
@@ -126,7 +217,7 @@ def _resolve_image(image: str) -> str:
     raw = p.read_bytes()
     if len(raw) > MAX_IMAGE_BYTES:
         raise ValueError(
-            f"图片过大: {len(raw)//1024}KB > {MAX_IMAGE_BYTES//1024}KB，请压缩后再试"
+            f"图片过大: {len(raw) // 1024}KB > {MAX_IMAGE_BYTES // 1024}KB，请压缩后再试"
         )
 
     if AUTO_RESIZE:
@@ -137,51 +228,108 @@ def _resolve_image(image: str) -> str:
 
 
 def _maybe_resize(raw: bytes, mime: str) -> tuple[bytes, str]:
-    """图片任一边超过 MAX_IMAGE_DIMENSION 时等比缩小并转 JPEG。"""
+    """超长边图片等比缩小并转 JPEG；存在 EXIF 旋转时修正方向。失败则原样返回。"""
+    if Image is None:
+        return raw, mime
     try:
         buf = io.BytesIO(raw)
         img = Image.open(buf)
+        exif = img.getexif()
+        orientation = exif.get(274, 1)  # EXIF Orientation tag
+        needs_transpose = orientation not in (1, None)
+        if needs_transpose and ImageOps is not None:
+            img = ImageOps.exif_transpose(img)
+            # 像素已修正，删除 orientation tag 防止下游二次旋转
+            exif = img.getexif()
+            if 274 in exif:
+                del exif[274]
         w, h = img.size
-        if max(w, h) <= MAX_IMAGE_DIMENSION:
+        if max(w, h) <= MAX_IMAGE_DIMENSION and not needs_transpose:
             return raw, mime
-        ratio = MAX_IMAGE_DIMENSION / max(w, h)
-        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-        if img.mode in ("RGBA", "LA", "P"):
+        if max(w, h) > MAX_IMAGE_DIMENSION:
+            ratio = MAX_IMAGE_DIMENSION / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        # 统一转 RGB 后存 JPEG，兼容 RGBA / 调色板 / LA 等模式
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        if img.mode in ("RGBA", "LA"):
             img = img.convert("RGB")
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=85)
+        # exif 必须是 Exif 对象而非 None（空对象也算），否则 Pillow 报错
+        img.save(out, format="JPEG", quality=85, exif=exif)
         return out.getvalue(), "image/jpeg"
     except Exception:
-        return raw, mime  # 缩放失败则原样发送
+        return raw, mime  # 处理失败则原样发送
+
+
+def _sniff_image_mime(raw: bytes) -> str:
+    """用 Pillow 探测裸 base64 图片的真实格式；探测失败时回退 PNG。"""
+    if Image is not None:
+        try:
+            img = Image.open(io.BytesIO(raw))
+            return _FORMAT_TO_MIME.get(img.format or "", "image/png")
+        except Exception:
+            pass
+    return "image/png"
 
 
 # --------------------------------------------------------------------------- #
 # 调用 OpenAI 兼容视觉后端
 # --------------------------------------------------------------------------- #
+def _retry_delay(attempt: int) -> float:
+    return RETRY_BACKOFF * (2 ** attempt)
+
+
+def _log_retry(reason: str, attempt: int) -> None:
+    _log_warning(f"{reason}，{_retry_delay(attempt):.1f}s 后重试（第 {attempt + 1}/{MAX_RETRIES} 次）")
+
+
 def _call_vision(content: list) -> str:
-    """调用 Chat Completions 接口，返回纯文本。"""
+    """调用 Chat Completions 接口，返回纯文本；对瞬时故障自动重试。"""
     payload = {
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
         "messages": [{"role": "user", "content": content}],
     }
-    req = urllib.request.Request(
-        f"{BASE_URL}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"视觉 API 返回 {e.code}: {body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"网络错误: {e.reason}") from e
+    headers = {"Content-Type": "application/json"}
+    # 无鉴权后端（本地 vLLM 等）留空 key 时不要发送 Authorization 头
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+
+    data = None
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            f"{BASE_URL}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                raw_body = resp.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(raw_body)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"视觉 API 返回非 JSON 响应（前 300 字符）: {raw_body[:300]}"
+                ) from e
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            retryable = e.code in (408, 429) or e.code >= 500
+            if retryable and attempt < MAX_RETRIES:
+                _log_retry(f"HTTP {e.code}", attempt)
+                time.sleep(_retry_delay(attempt))
+                continue
+            raise RuntimeError(f"视觉 API 返回 {e.code}: {body}") from e
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            if attempt < MAX_RETRIES:
+                reason = getattr(e, "reason", e)
+                _log_retry(f"网络错误: {reason}", attempt)
+                time.sleep(_retry_delay(attempt))
+                continue
+            reason = getattr(e, "reason", e)
+            raise RuntimeError(f"网络错误: {reason}") from e
 
     try:
         msg = data["choices"][0]["message"]
@@ -207,11 +355,42 @@ def _image_content(data_url: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# MCP Prompt：教主导航模型何时使用视觉工具
+# --------------------------------------------------------------------------- #
+@mcp.prompt(
+    name="vision_instructions",
+    title="图片处理指引",
+    description="教主导航模型识别图片场景并正确调用 vision-mcp 的视觉工具。",
+)
+def vision_instructions() -> str:
+    """当对话中遇到以下情况，直接调用对应的视觉工具，不要猜测图片内容：
+
+1. 用户粘贴了图片、截图路径、图片 URL，或要求"查看/分析/识别/描述这张图"：
+   调用 vision_analyze（通用理解）或 vision_ocr（只提取文字）。
+
+2. 图片是日志、终端、代码、报错弹窗或文档截图，需要逐字读取文字：
+   调用 vision_ocr。
+
+3. 需要同时分析多张图片（如多张截图对比、多页文档）：
+   调用 vision_analyze_batch，把每张图放进 items 列表。
+
+工具参数约定：
+- 本地文件路径用 image_path 参数；
+- http(s) URL 或 data: base64 用 image 参数；
+- image / image_path / image_url / image_base64 四选一，不要同时传多个。
+
+重要：
+- 不要用 Read 工具读取图片文件——你无法理解像素，应把图片交给上面的视觉工具。
+- 视觉工具返回的是文字，拿到后直接基于它回答用户即可。
+"""
+
+
+# --------------------------------------------------------------------------- #
 # MCP 工具
 # --------------------------------------------------------------------------- #
 @mcp.tool()
 def vision_analyze(
-    prompt: str,
+    prompt: str = "请详细描述这张图片的全部内容。",
     image: str = "",
     image_path: str = "",
     image_url: str = "",
@@ -220,10 +399,11 @@ def vision_analyze(
     """通用图片理解：把图片交给配置的多模态模型分析，返回文本描述。
 
     当主模型无法理解图片内容（截图、UI 图、流程图、报错截图、照片等）时使用。
+    当对话中出现图片路径、图片 URL、截图文件，或用户要求查看/分析/识别图片时，优先调用本工具。
     不要用 Read 工具读取图片文件。
 
     Args:
-        prompt: 具体分析要求，例如 "提取图中的报错信息和堆栈"。
+        prompt: 具体分析要求，例如 "提取图中的报错信息和堆栈"（可省略）。
         image: 图片，可为本地路径、http(s) URL 或 data: 前缀的 base64 URL。
         image_path: 本地图片路径（与 image 互斥，二选一）。
         image_url: 图片 URL（与 image 互斥，二选一）。
@@ -250,6 +430,7 @@ def vision_ocr(
     """纯 OCR：从图片中逐字提取可见文本，不做解释。
 
     适用于日志截图、终端截图、代码截图、错误弹窗、文档截图等。
+    当对话中出现图片路径、图片 URL 或用户要求提取图片文字时，优先调用本工具。
 
     Args:
         image: 图片，可为本地路径、http(s) URL 或 data: 前缀的 base64 URL。
@@ -271,6 +452,52 @@ def vision_ocr(
     return _call_vision(content)
 
 
+@mcp.tool()
+def vision_analyze_batch(
+    items: list[dict],
+    prompt: str = "请详细描述这张图片的全部内容。",
+    concurrency: int = 3,
+) -> str:
+    """批量分析多张图片：一次调用处理多张，单张失败不影响其他。
+
+    适用于对比多张截图（如 before/after UI 测试）、一次查看多张图表、多页文档等场景。
+
+    Args:
+        items: 图片列表，每项为 {"image"/"image_path"/"image_url"/"image_base64": 图片}，
+            可选的 "prompt" 覆盖该项的单独分析要求。
+        prompt: 未单独指定 prompt 的图片使用的默认分析要求。
+        concurrency: 并发请求数（1-8，默认 3）。
+
+    Returns:
+        按输入顺序编号的每张图片分析结果，失败项带错误原因。
+    """
+    if not items:
+        raise ValueError("items 不能为空")
+    if len(items) > 50:
+        raise ValueError("一次最多分析 50 张图片")
+    concurrency = max(1, min(8, int(concurrency)))
+
+    def _analyze_one(idx: int, item: dict) -> str:
+        try:
+            data_url = _pick_image(
+                str(item.get("image") or ""),
+                str(item.get("image_path") or ""),
+                str(item.get("image_url") or ""),
+                str(item.get("image_base64") or ""),
+            )
+            item_prompt = str(item.get("prompt") or "").strip() or prompt
+            text = _call_vision(
+                [_image_content(data_url), {"type": "text", "text": item_prompt}]
+            )
+            return f"[{idx}] 成功\n{text}"
+        except Exception as e:
+            return f"[{idx}] 失败: {e}"
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        results = list(pool.map(_analyze_one, range(len(items)), items))
+    return "\n\n".join(results)
+
+
 def _pick_image(image: str, image_path: str, image_url: str, image_base64: str) -> str:
     """从多个可选参数中确定唯一图片来源。"""
     provided = [v for v in (image, image_path, image_url, image_base64) if v and v.strip()]
@@ -280,13 +507,60 @@ def _pick_image(image: str, image_path: str, image_url: str, image_base64: str) 
         raise ValueError("请提供图片：image / image_path / image_url / image_base64 任选其一")
 
     if image_base64:
-        return f"data:image/png;base64,{image_base64}"
+        value = image_base64.strip()
+        header, payload = "", value
+        if value.startswith("data:"):
+            header, _, payload = value.partition(",")
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except Exception as e:
+            raise ValueError("image_base64 不是合法的 base64 内容") from e
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"图片过大: {len(raw) // 1024}KB > {MAX_IMAGE_BYTES // 1024}KB，请压缩后再试"
+            )
+        mime = header.split(";")[0].split(":", 1)[-1] or _sniff_image_mime(raw)
+        if AUTO_RESIZE:
+            raw, mime = _maybe_resize(raw, mime)
+        return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
     if image_url:
-        if image_url.startswith("data:"):
-            return image_url
-        return image_url
+        value = image_url.strip()
+        if value.startswith(("http://", "https://", "data:")):
+            return value
+        raise ValueError("image_url 必须以 http://、https:// 或 data: 开头")
     return _resolve_image(provided[0])
 
 
+# --------------------------------------------------------------------------- #
+# 诊断与入口
+# --------------------------------------------------------------------------- #
+def _print_effective_config() -> None:
+    """打印生效配置（API key 脱敏），用于排查接入问题。"""
+    def mask(key: str) -> str:
+        if not key:
+            return "(未设置)"
+        if len(key) <= 8:
+            return "****"
+        return f"{key[:4]}****{key[-4:]}"
+
+    print(f"server_name         : {SERVER_NAME}")
+    print(f"base_url            : {BASE_URL}")
+    print(f"model               : {MODEL}")
+    print(f"api_key             : {mask(API_KEY)}")
+    print(f"max_tokens          : {MAX_TOKENS}")
+    print(f"timeout             : {TIMEOUT}s")
+    print(f"max_retries         : {MAX_RETRIES}")
+    print(f"retry_backoff       : {RETRY_BACKOFF}s")
+    print(f"max_image_bytes     : {MAX_IMAGE_BYTES} ({MAX_IMAGE_BYTES // 1024}KB)")
+    print(f"max_image_dimension : {MAX_IMAGE_DIMENSION}px")
+    print(f"auto_resize         : {AUTO_RESIZE}")
+    print(f"pillow_available    : {Image is not None}")
+    print(f"config_file         : {CONFIG_PATH}")
+    print(f"dotenv_file         : {DOTENV_PATH}")
+
+
 if __name__ == "__main__":
-    mcp.run()
+    if "--check" in sys.argv:
+        _print_effective_config()
+    else:
+        mcp.run()

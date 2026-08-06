@@ -1,10 +1,9 @@
-# vision-mcp 配置文件
-# 复制此文件为 config.json 并填写实际值
-
 {
   "api_key": "sk-your-dashscope-api-key",
   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "model": "qwen-vl-plus",
   "max_tokens": 4096,
-  "timeout": 120
+  "timeout": 120,
+  "max_retries": 2,
+  "retry_backoff": 2
 }
