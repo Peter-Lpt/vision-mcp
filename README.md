@@ -1,23 +1,15 @@
 # vision-mcp
 
-为纯文本主模型（Claude Code / Codex / pi 等）补齐视觉能力的轻量工具。当主模型遇到图片但无法理解时，把图片交给 OpenAI 兼容的多模态后端（Qwen-VL、GPT-4o、Gemini、本地 vLLM 等）分析，返回文本结果。
+为纯文本主模型补齐视觉能力的轻量 MCP server。当主模型遇到图片（截图、UI 图、流程图、报错截图等）但无法理解时，通过 MCP 工具把图片交给 OpenAI 兼容的多模态后端（Qwen-VL、GPT-4o、Gemini、本地 vLLM 等）分析，返回文本结果。
 
-提供两种形态，共用同一套视觉后端与配置键：
-
-- **`server.py`** — MCP server（Python），供 MCP 客户端使用；
-- **`pi-extensions/vision-mcp.ts`** — pi 扩展（单文件），供 pi 使用。
-
-## pi 扩展安装
-
-```bash
-cp pi-extensions/vision-mcp.ts ~/.pi/agent/extensions/
-# 图片缩放依赖（可选，未装则自动降级为不缩放）
-cd ~/.pi/agent/extensions && npm i sharp
+```
+主模型(纯文本) ──调用 MCP 工具──▶ vision-mcp ──Chat Completions──▶ 多模态模型
+   Claude/Codex ◀──────文本结果───────◀──────────────────────────   Qwen-VL / GPT-4o / ...
 ```
 
-复制后重启 pi 或 `/reload` 即自动加载。扩展由 pi 自动发现，无需 `pi install`。
+## 安装
 
-## MCP 安装
+先安装 MCP server 本体（Python）：
 
 ```bash
 # Windows
@@ -26,34 +18,41 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ./install.sh
 ```
 
-## 安装后配置引导
+然后按你的客户端接入：
 
-两种形态各自需要一份配置文件，**api_key 必填，其余可留默认**。
-
-**pi 扩展**：创建 `~/.pi/vision-mcp/config.json`（或设置 `VISION_CONFIG_PATH` 指向任意路径）：
+### Claude Code
 
 ```bash
-mkdir -p ~/.pi/vision-mcp
-cat > ~/.pi/vision-mcp/config.json <<'EOF'
-{
-  "api_key": "sk-你的视觉后端key",
-  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "model": "qwen-vl-plus"
-}
-EOF
+claude mcp add vision-mcp -- \
+  python /绝对/路径/vision-mcp/server.py
 ```
 
-**MCP**：复制模板并填写：
+### Codex
 
 ```bash
-cp config.example.json config.json   # 再编辑 api_key 等字段
+codex mcp add vision-mcp -- \
+  python /绝对/路径/vision-mcp/server.py
 ```
 
-**验证**：pi 扩展直接提问“分析这张图”即可；MCP 运行 `python server.py --check` 确认配置生效（api_key 脱敏）。
+> 修改 MCP 配置后需重启客户端生效。
+
+### pi
+
+```bash
+cp pi-extensions/vision-mcp.ts ~/.pi/agent/extensions/
+# 图片缩放依赖（可选，未装则自动降级为不缩放）
+cd ~/.pi/agent/extensions && npm i sharp
+```
+
+复制后重启 pi 或 `/reload` 自动加载，无需 `pi install`。
 
 ## 配置
 
 优先级：`config.json` > 进程环境变量 > `.env` > 默认值。`config.json` 已被 gitignore，不入库。
+
+```bash
+cp config.example.json config.json   # 再编辑 api_key 等字段
+```
 
 ```json
 {
@@ -66,6 +65,8 @@ cp config.example.json config.json   # 再编辑 api_key 等字段
   "retry_backoff": 2
 }
 ```
+
+**pi 扩展**额外读取 `~/.pi/vision-mcp/config.json`（或用 `VISION_CONFIG_PATH` 指定），键与上述一致。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -87,17 +88,6 @@ cp config.example.json config.json   # 再编辑 api_key 等字段
 ```bash
 python server.py --check   # 打印生效配置，API key 脱敏
 ```
-
-## MCP 接入
-
-```bash
-# Claude Code
-claude mcp add vision-mcp -- python /绝对/路径/vision-mcp/server.py
-# Codex
-codex mcp add vision-mcp -- python /绝对/路径/vision-mcp/server.py
-```
-
-> 修改 MCP 配置后需重启客户端生效。
 
 ## 工具
 
