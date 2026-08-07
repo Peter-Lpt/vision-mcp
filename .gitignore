@@ -8,3 +8,4 @@ venv/
 config.json
 .codex/
 *.egg-info/
+.idea/
