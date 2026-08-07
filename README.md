@@ -40,8 +40,8 @@ codex mcp add vision-mcp -- \
 
 ```bash
 cp pi-extensions/vision-mcp.ts ~/.pi/agent/extensions/
-# 图片缩放依赖（可选，未装则自动降级为不缩放）
-cd ~/.pi/agent/extensions && npm i sharp
+# 依赖：typebox（必需，工具参数模式定义）；sharp（可选，图片缩放，未装则自动降级为不缩放）
+cd ~/.pi/agent/extensions && npm i sharp typebox
 ```
 
 复制后重启 pi 或 `/reload` 自动加载，无需 `pi install`。
