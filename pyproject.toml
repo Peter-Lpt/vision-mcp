@@ -12,3 +12,7 @@ dependencies = [
     "mcp>=1.0,<2",
     "Pillow>=10.0.0",
 ]
+
+# 非包项目：脚本直接运行，不作为可分发包安装，避免 setuptools 自动发现报错
+[tool.setuptools]
+packages = []
