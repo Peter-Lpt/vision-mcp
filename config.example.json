@@ -1,4 +1,5 @@
 {
+  "api": "openai-completions",
   "api_key": "sk-your-dashscope-api-key",
   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "model": "qwen-vl-plus",

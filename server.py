@@ -147,6 +147,11 @@ BASE_URL = _get_config(
 ).rstrip("/")
 API_KEY = _get_config("api_key", "VISION_API_KEY")
 MODEL = _get_config("model", "VISION_MODEL", "qwen-vl-plus")
+# 后端 API 协议：openai-completions（OpenAI Chat Completions，默认）/ openai-responses（OpenAI Responses）/ anthropic-messages（Anthropic Messages）
+API = _get_config("api", "VISION_API", "openai-completions").strip().lower()
+if API not in ("openai-completions", "openai-responses", "anthropic-messages"):
+    _log_warning(f"配置 api={API!r} 不受支持，使用默认值 openai-completions")
+    API = "openai-completions"
 MAX_TOKENS = _as_int("max_tokens", "VISION_MAX_TOKENS", 4096)
 TIMEOUT = _as_float("timeout", "VISION_TIMEOUT", 120.0)
 MAX_RETRIES = _as_int("max_retries", "VISION_MAX_RETRIES", 2)
@@ -285,21 +290,46 @@ def _log_retry(reason: str, attempt: int) -> None:
 
 
 def _call_vision(content: list) -> str:
-    """调用 Chat Completions 接口，返回纯文本；对瞬时故障自动重试。"""
-    payload = {
-        "model": MODEL,
-        "max_tokens": MAX_TOKENS,
-        "messages": [{"role": "user", "content": content}],
-    }
-    headers = {"Content-Type": "application/json"}
-    # 无鉴权后端（本地 vLLM 等）留空 key 时不要发送 Authorization 头
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    """按 api 协议调用视觉后端，返回纯文本；对瞬时故障自动重试。"""
+    if API == "anthropic-messages":
+        url = f"{BASE_URL}/v1/messages"
+        payload = {
+            "model": MODEL,
+            "max_tokens": MAX_TOKENS,
+            "messages": [{"role": "user", "content": content}],
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        # 无鉴权后端留空 key 时不发送鉴权头
+        if API_KEY:
+            headers["x-api-key"] = API_KEY
+    elif API == "openai-responses":
+        url = f"{BASE_URL}/responses"
+        payload = {
+            "model": MODEL,
+            "max_output_tokens": MAX_TOKENS,
+            "input": [{"role": "user", "content": content}],
+        }
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+    else:  # openai-completions（默认）
+        url = f"{BASE_URL}/chat/completions"
+        payload = {
+            "model": MODEL,
+            "max_tokens": MAX_TOKENS,
+            "messages": [{"role": "user", "content": content}],
+        }
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
 
     data = None
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
-            f"{BASE_URL}/chat/completions",
+            url,
             data=json.dumps(payload).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -331,6 +361,32 @@ def _call_vision(content: list) -> str:
             reason = getattr(e, "reason", e)
             raise RuntimeError(f"网络错误: {reason}") from e
 
+    if API == "openai-responses":
+        parts = []
+        for item in data.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "message":
+                for block in item.get("content") or []:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "output_text"
+                        and block.get("text")
+                    ):
+                        parts.append(block["text"])
+        if parts:
+            return "".join(parts)
+        raise RuntimeError(f"视觉 API 返回空文本: {data}")
+
+    if API == "anthropic-messages":
+        blocks = data.get("content") or []
+        texts = [
+            b.get("text", "")
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ]
+        if texts:
+            return "".join(texts)
+        raise RuntimeError(f"视觉 API 返回空文本: {data}")
+
     try:
         msg = data["choices"][0]["message"]
     except (KeyError, IndexError) as e:
@@ -351,6 +407,16 @@ def _call_vision(content: list) -> str:
 
 
 def _image_content(data_url: str) -> dict:
+    """把 data URL 转成当前 api 协议要求的图片 content 块。"""
+    if API == "openai-responses":
+        return {"type": "input_image", "image_url": data_url}
+    if API == "anthropic-messages":
+        header, _, payload = data_url.partition(",")
+        mime = header.split(";")[0].split(":", 1)[-1] or "image/png"
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime, "data": payload},
+        }
     return {"type": "image_url", "image_url": {"url": data_url}}
 
 
@@ -544,6 +610,7 @@ def _print_effective_config() -> None:
         return f"{key[:4]}****{key[-4:]}"
 
     print(f"server_name         : {SERVER_NAME}")
+    print(f"api                 : {API}")
     print(f"base_url            : {BASE_URL}")
     print(f"model               : {MODEL}")
     print(f"api_key             : {mask(API_KEY)}")

@@ -56,6 +56,7 @@ cp config.example.json config.json   # 再编辑 api_key 等字段
 
 ```json
 {
+  "api": "openai-completions",
   "api_key": "sk-your-dashscope-api-key",
   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "model": "qwen-vl-plus",
@@ -70,6 +71,7 @@ cp config.example.json config.json   # 再编辑 api_key 等字段
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `VISION_API` | `openai-completions` | 后端 API 协议：`openai-completions`（OpenAI Chat Completions）/ `openai-responses`（OpenAI Responses API）/ `anthropic-messages`(Anthropic Messages API)；后两者需 base_url 指向对应端点 |
 | `VISION_API_KEY` | - | 视觉后端 API Key |
 | `VISION_BASE_URL` | dashscope | OpenAI 兼容端点 |
 | `VISION_MODEL` | `qwen-vl-plus` | 视觉模型名 |

@@ -28,6 +28,7 @@ import { join, resolve as resolvePath } from "node:path";
 // 配置
 // --------------------------------------------------------------------------- #
 interface VisionConfig {
+  api: string;
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -42,6 +43,7 @@ interface VisionConfig {
 }
 
 const DEFAULTS = {
+  api: "openai-completions",
   baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   apiKey: "",
   model: "qwen-vl-plus",
@@ -93,7 +95,13 @@ function loadConfig(): VisionConfig {
     return def;
   };
 
+  const api = str("api", "VISION_API", DEFAULTS.api).toLowerCase();
+  if (!["openai-completions", "openai-responses", "anthropic-messages"].includes(api)) {
+    console.error(`vision-mcp: 配置 api=${api} 不受支持，使用默认值 openai-completions`);
+  }
+
   return {
+    api: ["openai-responses", "anthropic-messages"].includes(api) ? api : "openai-completions",
     baseUrl: str("base_url", "VISION_BASE_URL", DEFAULTS.baseUrl).replace(/\/+$/, ""),
     apiKey: str("api_key", "VISION_API_KEY", DEFAULTS.apiKey),
     model: str("model", "VISION_MODEL", DEFAULTS.model),
@@ -128,6 +136,19 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 function imageContent(dataUrl: string): Record<string, unknown> {
+  if (config.api === "openai-responses") {
+    return { type: "input_image", image_url: dataUrl };
+  }
+  if (config.api === "anthropic-messages") {
+    const comma = dataUrl.indexOf(",");
+    const header = dataUrl.slice(0, comma);
+    const payload = dataUrl.slice(comma + 1);
+    const mime = header.split(";")[0].split(":")[1] || "image/png";
+    return {
+      type: "image",
+      source: { type: "base64", media_type: mime, data: payload },
+    };
+  }
   return { type: "image_url", image_url: { url: dataUrl } };
 }
 
@@ -271,14 +292,31 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function callVision(content: unknown[], signal?: AbortSignal): Promise<string> {
-  const payload = {
-    model: config.model,
-    max_tokens: config.maxTokens,
-    messages: [{ role: "user", content }],
-  };
+  const anthropic = config.api === "anthropic-messages";
+  const responses = config.api === "openai-responses";
+  const payload = responses
+    ? {
+        model: config.model,
+        max_output_tokens: config.maxTokens,
+        input: [{ role: "user", content }],
+      }
+    : {
+        model: config.model,
+        max_tokens: config.maxTokens,
+        messages: [{ role: "user", content }],
+      };
+  const url = anthropic
+    ? `${config.baseUrl}/v1/messages`
+    : responses
+      ? `${config.baseUrl}/responses`
+      : `${config.baseUrl}/chat/completions`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (config.apiKey) headers["Authorization"] = `Bearer ${config.apiKey}`;
-  const url = `${config.baseUrl}/chat/completions`;
+  if (anthropic) {
+    headers["x-api-key"] = config.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else if (config.apiKey) {
+    headers["Authorization"] = `Bearer ${config.apiKey}`;
+  }
 
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
@@ -303,6 +341,30 @@ async function callVision(content: unknown[], signal?: AbortSignal): Promise<str
         data = JSON.parse(text);
       } catch {
         throw new Error(`视觉 API 返回非 JSON 响应（前 300 字符）: ${text.slice(0, 300)}`);
+      }
+      if (responses) {
+        const output = data?.output;
+        if (Array.isArray(output)) {
+          const texts = output
+            .filter((o: any) => o && o.type === "message")
+            .flatMap((o: any) => o.content ?? [])
+            .filter((b: any) => b && b.type === "output_text" && b.text)
+            .map((b: any) => b.text)
+            .join("");
+          if (texts) return texts;
+        }
+        throw new Error(`视觉 API 返回空文本: ${JSON.stringify(data)}`);
+      }
+      if (anthropic) {
+        const blocks = data?.content;
+        if (Array.isArray(blocks)) {
+          const texts = blocks
+            .filter((b: any) => b && b.type === "text" && b.text)
+            .map((b: any) => b.text)
+            .join("");
+          if (texts) return texts;
+        }
+        throw new Error(`视觉 API 返回空文本: ${JSON.stringify(data)}`);
       }
       const msg = data?.choices?.[0]?.message;
       if (!msg) {
