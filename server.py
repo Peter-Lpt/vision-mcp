@@ -16,6 +16,7 @@
 """
 
 import base64
+import hashlib
 import http.client
 import importlib.metadata
 import io
@@ -26,6 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -156,6 +158,8 @@ MAX_TOKENS = _as_int("max_tokens", "VISION_MAX_TOKENS", 4096)
 TIMEOUT = _as_float("timeout", "VISION_TIMEOUT", 120.0)
 MAX_RETRIES = _as_int("max_retries", "VISION_MAX_RETRIES", 2)
 RETRY_BACKOFF = _as_float("retry_backoff", "VISION_RETRY_BACKOFF", 2.0)
+CACHE_MAX_ENTRIES = _as_int("cache_max_entries", "VISION_CACHE_MAX_ENTRIES", 256)
+CACHE_ENABLED = _as_bool("cache_enabled", "VISION_CACHE_ENABLED", True)
 MAX_IMAGE_BYTES = _as_int(
     "max_image_bytes", "VISION_MAX_IMAGE_BYTES", 20 * 1024 * 1024
 )
@@ -170,24 +174,70 @@ if AUTO_RESIZE and Image is None:
     _log_warning("未安装 Pillow，图片自动缩放已禁用；建议执行 pip install -r requirements.txt")
     AUTO_RESIZE = False
 
-_ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+# 仅保留主流视觉后端(OpenAI/Anthropic)原生支持的格式；BMP 后端普遍不支持，故排除
+_ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _MIME_BY_EXT = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
     ".gif": "image/gif",
-    ".bmp": "image/bmp",
 }
 _FORMAT_TO_MIME = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
     "WEBP": "image/webp",
     "GIF": "image/gif",
-    "BMP": "image/bmp",
 }
 
 mcp = FastMCP(SERVER_NAME)
+
+
+class VisionError(Exception):
+    """带结构化错误码的异常，便于客户端按 code 编程处理（如重试/提示用户）。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"[{self.code}] {self.message}"
+
+
+# --------------------------------------------------------------------------- #
+# 内容寻址缓存：相同图片 + 相同提示 + 相同模型在窗口内复用，避免重复调用视觉后端
+# --------------------------------------------------------------------------- #
+_cache: OrderedDict[str, str] = OrderedDict()
+
+
+def _cache_key(image_value: str, prompt: str) -> str:
+    """内容寻址缓存 key：图片 data URL + 提示 + 模型 + API 协议。
+
+    图片 data URL 由原始字节 + 压缩参数确定，同一来源在相配配置下具有确定性，
+    因此可作为内容指纹（无需再散列原始字节）。
+    """
+    raw = f"{MODEL}\x00{API}\x00{image_value}\x00{prompt}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str) -> str | None:
+    if not CACHE_ENABLED:
+        return None
+    val = _cache.get(key)
+    if val is not None:
+        _cache.move_to_end(key)
+        return val
+    return None
+
+
+def _cache_set(key: str, value: str) -> None:
+    if not CACHE_ENABLED:
+        return
+    _cache[key] = value
+    _cache.move_to_end(key)
+    while len(_cache) > CACHE_MAX_ENTRIES:
+        _cache.popitem(last=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +247,7 @@ def _resolve_image(image: str) -> str:
     """把本地路径 / http(s) URL / data URL 统一解析为可放入 OpenAI image_url 的字符串。"""
     image = image.strip()
     if not image:
-        raise ValueError("image 不能为空")
+        raise VisionError("empty_image", "image 不能为空")
 
     # 已是 data URL -> 直接透传
     if image.startswith("data:"):
@@ -212,17 +262,21 @@ def _resolve_image(image: str) -> str:
     if not p.is_absolute():
         p = (Path.cwd() / p).resolve()
     if not p.exists():
-        raise FileNotFoundError(f"图片不存在: {p}")
+        raise VisionError("not_found", f"图片不存在: {p}")
 
     ext = p.suffix.lower()
     if ext not in _ALLOWED_EXT:
-        raise ValueError(f"不支持的格式 {ext or '(无扩展名)'}; 仅支持 {sorted(_ALLOWED_EXT)}")
+        raise VisionError(
+            "unsupported_format",
+            f"不支持的格式 {ext or '(无扩展名)'}; 仅支持 {sorted(_ALLOWED_EXT)}",
+        )
     mime = _MIME_BY_EXT.get(ext) or mimetypes.guess_type(image)[0] or "application/octet-stream"
 
     raw = p.read_bytes()
     if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError(
-            f"图片过大: {len(raw) // 1024}KB > {MAX_IMAGE_BYTES // 1024}KB，请压缩后再试"
+        raise VisionError(
+            "too_large",
+            f"图片过大: {len(raw) // 1024}KB > {MAX_IMAGE_BYTES // 1024}KB，请压缩后再试",
         )
 
     if AUTO_RESIZE:
@@ -479,11 +533,17 @@ def vision_analyze(
         视觉模型返回的文本分析。
     """
     data_url = _pick_image(image, image_path, image_url, image_base64)
+    key = _cache_key(data_url, prompt)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
     content = [
         _image_content(data_url),
         {"type": "text", "text": prompt},
     ]
-    return _call_vision(content)
+    text = _call_vision(content)
+    _cache_set(key, text)
+    return text
 
 
 @mcp.tool()
@@ -508,14 +568,19 @@ def vision_ocr(
         保留换行缩进的原始文本。
     """
     data_url = _pick_image(image, image_path, image_url, image_base64)
-    content = [
-        _image_content(data_url),
-        {"type": "text", "text":
-            "请逐字转录图中所有可见文本，保留换行和缩进结构。"
-            "只输出文字内容，不要解释，不要添加任何评注。"
-            "无法识别的字符用 [?] 代替。"},
-    ]
-    return _call_vision(content)
+    prompt = (
+        "请逐字转录图中所有可见文本，保留换行和缩进结构。"
+        "只输出文字内容，不要解释，不要添加任何评注。"
+        "无法识别的字符用 [?] 代替。"
+    )
+    key = _cache_key(data_url, prompt)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    content = [_image_content(data_url), {"type": "text", "text": prompt}]
+    text = _call_vision(content)
+    _cache_set(key, text)
+    return text
 
 
 @mcp.tool()
@@ -538,9 +603,9 @@ def vision_analyze_batch(
         按输入顺序编号的每张图片分析结果，失败项带错误原因。
     """
     if not items:
-        raise ValueError("items 不能为空")
+        raise VisionError("empty_items", "items 不能为空")
     if len(items) > 50:
-        raise ValueError("一次最多分析 50 张图片")
+        raise VisionError("too_many_items", "一次最多分析 50 张图片")
     concurrency = max(1, min(8, int(concurrency)))
 
     def _analyze_one(idx: int, item: dict) -> str:
@@ -552,9 +617,14 @@ def vision_analyze_batch(
                 str(item.get("image_base64") or ""),
             )
             item_prompt = str(item.get("prompt") or "").strip() or prompt
+            key = _cache_key(data_url, item_prompt)
+            cached = _cache_get(key)
+            if cached is not None:
+                return f"[{idx}] 成功\n{cached}"
             text = _call_vision(
                 [_image_content(data_url), {"type": "text", "text": item_prompt}]
             )
+            _cache_set(key, text)
             return f"[{idx}] 成功\n{text}"
         except Exception as e:
             return f"[{idx}] 失败: {e}"
@@ -568,9 +638,9 @@ def _pick_image(image: str, image_path: str, image_url: str, image_base64: str) 
     """从多个可选参数中确定唯一图片来源。"""
     provided = [v for v in (image, image_path, image_url, image_base64) if v and v.strip()]
     if len(provided) > 1:
-        raise ValueError("image / image_path / image_url / image_base64 只能填写一个")
+        raise VisionError("multiple_sources", "image / image_path / image_url / image_base64 只能填写一个")
     if not provided:
-        raise ValueError("请提供图片：image / image_path / image_url / image_base64 任选其一")
+        raise VisionError("no_source", "请提供图片：image / image_path / image_url / image_base64 任选其一")
 
     if image_base64:
         value = image_base64.strip()
@@ -580,10 +650,11 @@ def _pick_image(image: str, image_path: str, image_url: str, image_base64: str) 
         try:
             raw = base64.b64decode(payload, validate=True)
         except Exception as e:
-            raise ValueError("image_base64 不是合法的 base64 内容") from e
+            raise VisionError("invalid_base64", "image_base64 不是合法的 base64 内容") from e
         if len(raw) > MAX_IMAGE_BYTES:
-            raise ValueError(
-                f"图片过大: {len(raw) // 1024}KB > {MAX_IMAGE_BYTES // 1024}KB，请压缩后再试"
+            raise VisionError(
+                "too_large",
+                f"图片过大: {len(raw) // 1024}KB > {MAX_IMAGE_BYTES // 1024}KB，请压缩后再试",
             )
         mime = header.split(";")[0].split(":", 1)[-1] or _sniff_image_mime(raw)
         if AUTO_RESIZE:
@@ -593,7 +664,7 @@ def _pick_image(image: str, image_path: str, image_url: str, image_base64: str) 
         value = image_url.strip()
         if value.startswith(("http://", "https://", "data:")):
             return value
-        raise ValueError("image_url 必须以 http://、https:// 或 data: 开头")
+        raise VisionError("invalid_url", "image_url 必须以 http://、https:// 或 data: 开头")
     return _resolve_image(provided[0])
 
 
@@ -621,6 +692,7 @@ def _print_effective_config() -> None:
     print(f"max_image_bytes     : {MAX_IMAGE_BYTES} ({MAX_IMAGE_BYTES // 1024}KB)")
     print(f"max_image_dimension : {MAX_IMAGE_DIMENSION}px")
     print(f"auto_resize         : {AUTO_RESIZE}")
+    print(f"cache_enabled       : {CACHE_ENABLED} (max {CACHE_MAX_ENTRIES} entries)")
     print(f"pillow_available    : {Image is not None}")
     print(f"config_file         : {CONFIG_PATH}")
     print(f"dotenv_file         : {DOTENV_PATH}")

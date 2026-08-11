@@ -44,7 +44,7 @@ cp pi-extensions/vision-mcp.ts ~/.pi/agent/extensions/
 cd ~/.pi/agent/extensions && npm i sharp typebox
 ```
 
-复制后重启 pi 或 `/reload` 自动加载，无需 `pi install`。
+复制后重启 pi 或 `/reload` 自动加载，无需 `pi install`。**pi 扩展支持能力门控**：当主模型原生支持图片（`input` 含 `image`）时自动隐藏三个视觉工具避免多余委派，纯文本主模型才显示。
 
 ## 配置
 
@@ -82,6 +82,10 @@ cp config.example.json config.json   # 再编辑 api_key 等字段
 | `VISION_MAX_IMAGE_BYTES` | `20971520` | 单图大小上限（字节） |
 | `VISION_MAX_IMAGE_DIMENSION` | `4000` | 图片最大边长 px，超限等比缩小 |
 | `VISION_AUTO_RESIZE` | `true` | 是否自动缩放图片 |
+| `VISION_CACHE_ENABLED` | `true` | 是否启用内存缓存（相同图片+提示在 LRU 窗口内复用，省视觉 API 调用） |
+| `VISION_CACHE_MAX_ENTRIES` | `256` | 缓存最大条目数 |
+
+> 支持格式：PNG / JPEG / WebP / GIF（BMP 因主流视觉后端不支持而被排除）。
 
 常见后端：DashScope（默认）`VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`；OpenAI `model=gpt-4o`；本地 vLLM `base_url=http://localhost:8000/v1`。
 

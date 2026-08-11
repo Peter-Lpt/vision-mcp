@@ -40,6 +40,8 @@ interface VisionConfig {
   maxImageDimension: number;
   autoResize: boolean;
   autoTranscribe: boolean;
+  cacheEnabled: boolean;
+  cacheMaxEntries: number;
 }
 
 const DEFAULTS = {
@@ -55,6 +57,8 @@ const DEFAULTS = {
   maxImageDimension: 4000,
   autoResize: true,
   autoTranscribe: true,
+  cacheEnabled: true,
+  cacheMaxEntries: 256,
 };
 
 const CONFIG_PATH = process.env.VISION_CONFIG_PATH
@@ -117,22 +121,63 @@ function loadConfig(): VisionConfig {
     ),
     autoResize: bool("auto_resize", "VISION_AUTO_RESIZE", DEFAULTS.autoResize),
     autoTranscribe: bool("auto_transcribe", "VISION_AUTO_TRANSCRIBE", DEFAULTS.autoTranscribe),
+    cacheEnabled: bool("cache_enabled", "VISION_CACHE_ENABLED", DEFAULTS.cacheEnabled),
+    cacheMaxEntries: num("cache_max_entries", "VISION_CACHE_MAX_ENTRIES", DEFAULTS.cacheMaxEntries),
   };
 }
 
 const config = loadConfig();
 
+/** 带结构化错误码的异常，便于上层按 code 编程处理。 */
+export class VisionError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "VisionError";
+    this.code = code;
+  }
+}
+
+// --------------------------------------------------------------------------- #
+// 内容寻址缓存：相同图片(data URL) + 相同提示 + 相同模型在窗口内复用
+// --------------------------------------------------------------------------- #
+const _cache = new Map<string, string>();
+
+function cacheKey(imageValue: string, prompt: string): string {
+  return `${config.api}\u0000${config.model}\u0000${imageValue}\u0000${prompt}`;
+}
+
+function cacheGet(key: string): string | undefined {
+  if (!config.cacheEnabled) return undefined;
+  const val = _cache.get(key);
+  if (val !== undefined) {
+    _cache.delete(key);
+    _cache.set(key, val); // 置为最近使用
+  }
+  return val;
+}
+
+function cacheSet(key: string, value: string): void {
+  if (!config.cacheEnabled) return;
+  _cache.set(key, value);
+  while (_cache.size > config.cacheMaxEntries) {
+    const oldest = _cache.keys().next().value;
+    if (oldest === undefined) break;
+    _cache.delete(oldest);
+  }
+}
+
 // --------------------------------------------------------------------------- #
 // 图片解析
 // --------------------------------------------------------------------------- #
-const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"];
+// 仅保留主流视觉后端(OpenAI/Anthropic)原生支持的格式；BMP 后端普遍不支持，故排除
+const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".gif"];
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
   ".gif": "image/gif",
-  ".bmp": "image/bmp",
 };
 
 function imageContent(dataUrl: string): Record<string, unknown> {
@@ -198,10 +243,10 @@ async function resolveImage(
     (v) => v && v.trim(),
   );
   if (provided.length > 1) {
-    throw new Error("image / image_path / image_url / image_base64 只能填写一个");
+    throw new VisionError("multiple_sources", "image / image_path / image_url / image_base64 只能填写一个");
   }
   if (provided.length === 0) {
-    throw new Error("请提供图片：image / image_path / image_url / image_base64 任选其一");
+    throw new VisionError("no_source", "请提供图片：image / image_path / image_url / image_base64 任选其一");
   }
 
   if (imageBase64) {
@@ -218,10 +263,11 @@ async function resolveImage(
       raw = Buffer.from(payload, "base64");
       if (raw.length === 0) throw new Error("empty");
     } catch {
-      throw new Error("image_base64 不是合法的 base64 内容");
+      throw new VisionError("invalid_base64", "image_base64 不是合法的 base64 内容");
     }
     if (raw.length > config.maxImageBytes) {
-      throw new Error(
+      throw new VisionError(
+        "too_large",
         `图片过大: ${Math.floor(raw.length / 1024)}KB > ${Math.floor(config.maxImageBytes / 1024)}KB，请压缩后再试`,
       );
     }
@@ -234,7 +280,7 @@ async function resolveImage(
   if (imageUrl) {
     const url = imageUrl.trim();
     if (!/^(https?:\/\/|data:)/.test(url)) {
-      throw new Error("image_url 必须以 http://、https:// 或 data: 开头");
+      throw new VisionError("invalid_url", "image_url 必须以 http://、https:// 或 data: 开头");
     }
     return url;
   }
@@ -250,15 +296,16 @@ async function resolveImage(
     p = resolvePath(cwd, p);
   }
   if (!existsSync(p)) {
-    throw new Error(`图片不存在: ${p}`);
+    throw new VisionError("not_found", `图片不存在: ${p}`);
   }
   const ext = p.slice(p.lastIndexOf(".")).toLowerCase();
   if (!ALLOWED_EXT.includes(ext)) {
-    throw new Error(`不支持的格式 ${ext || "(无扩展名)"}; 仅支持 ${ALLOWED_EXT.join(", ")}`);
+    throw new VisionError("unsupported_format", `不支持的格式 ${ext || "(无扩展名)"}; 仅支持 ${ALLOWED_EXT.join(", ")}`);
   }
   const raw = readFileSync(p);
   if (raw.length > config.maxImageBytes) {
-    throw new Error(
+    throw new VisionError(
+      "too_large",
       `图片过大: ${Math.floor(raw.length / 1024)}KB > ${Math.floor(config.maxImageBytes / 1024)}KB，请压缩后再试`,
     );
   }
@@ -413,7 +460,34 @@ const VISION_GUIDELINES = [
   "需要同时分析多张图片时，调用 vision_analyze_batch，把每张图放进 items 列表。",
 ];
 
+const VISION_TOOLS = ["vision_analyze", "vision_ocr", "vision_analyze_batch"];
+
+/** 主模型是否原生支持图片（input 能力含 image）。缺失时视为不支持（安全默认：多模态才隐藏工具）。 */
+function isMultimodal(model: unknown): boolean {
+  const m = model as { input?: string[] } | undefined;
+  return !!m?.input?.includes("image");
+}
+
+/**
+ * 按主模型能力同步视觉工具可见性。
+ * 多模态主模型 → 隐藏三个视觉工具（原生看图片，避免多余委派）；
+ * 纯文本主模型 → 显示（委派给视觉后端）。可安全地在 session_start / model_select 反复调用。
+ */
+function syncVisionTools(pi: ExtensionAPI, model: unknown): void {
+  const active = pi.getActiveTools();
+  const hasAny = VISION_TOOLS.some((t) => active.includes(t));
+  const shouldShow = !isMultimodal(model);
+  if (shouldShow && !hasAny) {
+    pi.setActiveTools([...new Set([...active, ...VISION_TOOLS])]);
+  } else if (!shouldShow && hasAny) {
+    pi.setActiveTools(active.filter((t) => !VISION_TOOLS.includes(t)));
+  }
+}
+
 export default function visionExtension(pi: ExtensionAPI) {
+  // 按主模型能力门控：多模态模型隐藏视觉工具，纯文本模型显示。可在 session_start / model_select 时同步。
+  pi.on("session_start", (_event, ctx) => syncVisionTools(pi, ctx.model));
+  pi.on("model_select", (event) => syncVisionTools(pi, event.model));
   // ------------------------------------------------------------------------- #
   // 工具：vision_analyze
   // ------------------------------------------------------------------------- #
@@ -440,7 +514,13 @@ export default function visionExtension(pi: ExtensionAPI) {
         signal,
       );
       const prompt = (params.prompt ?? "请详细描述这张图片的全部内容。").trim() || "请详细描述这张图片的全部内容。";
+      const key = cacheKey(dataUrl, prompt);
+      const cached = cacheGet(key);
+      if (cached !== undefined) {
+        return { content: [{ type: "text", text: cached }], details: {} };
+      }
       const text = await callVision([imageContent(dataUrl), { type: "text", text: prompt }], signal);
+      cacheSet(key, text);
       return { content: [{ type: "text", text }], details: {} };
     },
   });
@@ -467,18 +547,16 @@ export default function visionExtension(pi: ExtensionAPI) {
         ctx.cwd,
         signal,
       );
-      const text = await callVision(
-        [
-          imageContent(dataUrl),
-          {
-            type: "text",
-            text:
-              "请逐字转录图中所有可见文本，保留换行和缩进结构。" +
-              "只输出文字内容，不要解释，不要添加任何评注。无法识别的字符用 [?] 代替。",
-          },
-        ],
-        signal,
-      );
+      const prompt =
+        "请逐字转录图中所有可见文本，保留换行和缩进结构。" +
+        "只输出文字内容，不要解释，不要添加任何评注。无法识别的字符用 [?] 代替。";
+      const key = cacheKey(dataUrl, prompt);
+      const cached = cacheGet(key);
+      if (cached !== undefined) {
+        return { content: [{ type: "text", text: cached }], details: {} };
+      }
+      const text = await callVision([imageContent(dataUrl), { type: "text", text: prompt }], signal);
+      cacheSet(key, text);
       return { content: [{ type: "text", text }], details: {} };
     },
   });
@@ -508,8 +586,8 @@ export default function visionExtension(pi: ExtensionAPI) {
     }),
     async execute(toolCallId, params: any, signal, _onUpdate, ctx) {
       const items: any[] = params.items ?? [];
-      if (items.length === 0) throw new Error("items 不能为空");
-      if (items.length > 50) throw new Error("一次最多分析 50 张图片");
+      if (items.length === 0) throw new VisionError("empty_items", "items 不能为空");
+      if (items.length > 50) throw new VisionError("too_many_items", "一次最多分析 50 张图片");
       const concurrency = Math.max(1, Math.min(8, Number(params.concurrency ?? 3) || 3));
       const defaultPrompt =
         (params.prompt ?? "请详细描述这张图片的全部内容。").trim() ||
@@ -531,10 +609,17 @@ export default function visionExtension(pi: ExtensionAPI) {
               signal,
             );
             const itemPrompt = (String(item.prompt ?? "").trim() || defaultPrompt);
+            const key = cacheKey(dataUrl, itemPrompt);
+            const cached = cacheGet(key);
+            if (cached !== undefined) {
+              results[idx] = `[${idx}] 成功\n${cached}`;
+              continue;
+            }
             const text = await callVision(
               [imageContent(dataUrl), { type: "text", text: itemPrompt }],
               signal,
             );
+            cacheSet(key, text);
             results[idx] = `[${idx}] 成功\n${text}`;
           } catch (e) {
             results[idx] = `[${idx}] 失败: ${(e as Error).message}`;
