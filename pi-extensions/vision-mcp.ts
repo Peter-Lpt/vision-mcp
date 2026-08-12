@@ -448,16 +448,15 @@ async function callVision(content: unknown[], signal?: AbortSignal): Promise<str
 // 工具参数约定
 // --------------------------------------------------------------------------- #
 const IMAGE_ARGS = {
-  image: Type.Optional(Type.String({ description: "图片：本地路径、http(s) URL 或 data: base64 URL" })),
-  image_path: Type.Optional(Type.String({ description: "本地图片路径（与 image 互斥）" })),
-  image_url: Type.Optional(Type.String({ description: "图片 URL（与 image 互斥）" })),
-  image_base64: Type.Optional(Type.String({ description: "裸 base64 图片内容（与 image 互斥）" })),
+  image: Type.Optional(Type.String({ description: "图片：路径/URL/base64" })),
+  image_path: Type.Optional(Type.String({ description: "本地路径（与 image 互斥）" })),
+  image_url: Type.Optional(Type.String({ description: "URL（与 image 互斥）" })),
+  image_base64: Type.Optional(Type.String({ description: "裸 base64（与 image 互斥）" })),
 };
 
 const VISION_GUIDELINES = [
-  "当对话中出现图片路径、图片 URL、截图文件，或用户要求查看/分析/识别/描述图片时，调用 vision_analyze 或 vision_ocr，不要用 read 工具读取图片文件（你无法理解像素）。",
-  "图片是日志、终端、代码、报错弹窗或文档截图需要逐字提取文字时，调用 vision_ocr。",
-  "需要同时分析多张图片时，调用 vision_analyze_batch，把每张图放进 items 列表。",
+  "图片路径/URL/截图或要求看图时，调用 vision_analyze/vision_ocr，不要用 read 读图。",
+  "截图需逐字提取文字用 vision_ocr；多图对比/多页用 vision_analyze_batch。",
 ];
 
 const VISION_TOOLS = ["vision_analyze", "vision_ocr", "vision_analyze_batch"];
@@ -494,14 +493,11 @@ export default function visionExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "vision_analyze",
     label: "Vision Analyze",
-    description:
-      "通用图片理解：把图片交给配置的多模态模型分析，返回文本描述。当主模型无法理解图片内容（截图、UI 图、流程图、报错截图、照片等）时使用。",
-    promptSnippet: "分析图片内容并返回文本描述",
+    description: "通用图片理解：把图片交给多模态模型分析并返回文本描述。主模型无法理解图片（截图/UI图/报错图/照片）时使用。",
+    promptSnippet: "分析图片并返回描述",
     promptGuidelines: VISION_GUIDELINES,
     parameters: Type.Object({
-      prompt: Type.Optional(
-        Type.String({ description: "具体分析要求，例如 '提取图中的报错信息和堆栈'" }),
-      ),
+      prompt: Type.Optional(Type.String({ description: "具体分析要求，如 '提取报错信息'" })),
       ...IMAGE_ARGS,
     }),
     async execute(toolCallId, params: any, signal, _onUpdate, ctx) {
@@ -531,9 +527,8 @@ export default function visionExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "vision_ocr",
     label: "Vision OCR",
-    description:
-      "纯 OCR：从图片中逐字提取可见文本，不做解释。适用于日志截图、终端截图、代码截图、错误弹窗、文档截图等。",
-    promptSnippet: "逐字提取图片中的可见文本（OCR）",
+    description: "纯 OCR：从图片中逐字提取可见文本，不做解释。适用日志/终端/代码/报错截图。",
+    promptSnippet: "逐字提取图片文本（OCR）",
     promptGuidelines: VISION_GUIDELINES,
     parameters: Type.Object({
       ...IMAGE_ARGS,
@@ -567,9 +562,8 @@ export default function visionExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "vision_analyze_batch",
     label: "Vision Analyze Batch",
-    description:
-      "批量分析多张图片：一次调用处理多张，单张失败不影响其他。适用于对比截图、一次查看多张图表、多页文档等。",
-    promptSnippet: "批量分析多张图片",
+    description: "批量分析多张图片：一次处理多张，单张失败不影响其他。适用对比截图、多页文档。",
+    promptSnippet: "批量分析多图",
     promptGuidelines: VISION_GUIDELINES,
     parameters: Type.Object({
       items: Type.Array(
@@ -578,11 +572,11 @@ export default function visionExtension(pi: ExtensionAPI) {
           image_path: Type.Optional(Type.String()),
           image_url: Type.Optional(Type.String()),
           image_base64: Type.Optional(Type.String()),
-          prompt: Type.Optional(Type.String({ description: "该项单独的分析要求" })),
+          prompt: Type.Optional(Type.String({ description: "该项的分析要求" })),
         }),
       ),
-      prompt: Type.Optional(Type.String({ description: "未单独指定 prompt 的图片使用的默认分析要求" })),
-      concurrency: Type.Optional(Type.Number({ description: "并发请求数（1-8，默认 3）" })),
+      prompt: Type.Optional(Type.String({ description: "未指定 prompt 时的默认分析要求" })),
+      concurrency: Type.Optional(Type.Number({ description: "并发数（1-8，默认 3）" })),
     }),
     async execute(toolCallId, params: any, signal, _onUpdate, ctx) {
       const items: any[] = params.items ?? [];
