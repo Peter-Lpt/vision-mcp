@@ -7,7 +7,21 @@
    Claude/Codex ◀──────文本结果───────◀──────────────────────────   Qwen-VL / GPT-4o / ...
 ```
 
-## 安装
+## 快速开始
+
+**推荐**：用随仓库分发的 `bin/wrapper.sh` 直接启动。wrapper 首次调用会自动在目录下创建 `.venv` 并安装依赖（uv 优先，无 uv 则 venv+pip），无需手动安装；之后 exec 真正的 `server.py`。适用于 macOS / Linux。
+
+```bash
+# 方式一（推荐，免手动装依赖）：MCP client 指向 wrapper 即可
+claude mcp add vision-mcp -- /绝对/路径/vision-mcp/bin/wrapper.sh
+
+# 或先自测：wrapper 会自举依赖并启动 server
+/绝对/路径/vision-mcp/bin/wrapper.sh --check
+```
+
+Windows 请用 `python -m venv` + `install.ps1`，或直接 `python server.py`。
+
+## 安装（源码自建）
 
 先安装 MCP server 本体（Python）：
 
@@ -92,6 +106,9 @@ cp config.example.json config.json   # 再编辑 api_key 等字段
 ## 检查配置
 
 ```bash
+# wrapper 方式（依赖未装则先自举）
+./bin/wrapper.sh --check
+# 源码自建（依赖手动安装后）
 python server.py --check   # 打印生效配置，API key 脱敏
 ```
 

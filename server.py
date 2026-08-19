@@ -31,7 +31,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "0.1.0"
 
 try:
     from mcp.server.fastmcp import FastMCP

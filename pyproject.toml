@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vision-mcp"
-version = "1.1.0"
+version = "0.1.0"
 description = "轻量 MCP server：为纯文本主模型补齐视觉能力（图片理解 / OCR）"
 readme = "README.md"
 requires-python = ">=3.10"
